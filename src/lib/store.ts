@@ -1,14 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fetchLiveGeopoliticalFeeds } from "./ingestion";
+import { fetchLiveGeopoliticalFeeds, LIVE_FEEDS } from "./ingestion";
 import { clusterAndAnalyzeNews, computeGlobalRiskIndex, generateExecutiveBriefing } from "./intelligence";
 import { fetchLiveMarkets } from "./markets";
+import { buildOntologyGraph } from "./ontology";
 import type { IntelligenceSnapshot } from "./types";
 
 const DATA_DIR = path.join(process.cwd(), ".geopulse-data");
 const SNAPSHOT_FILE = path.join(DATA_DIR, "snapshot.json");
 const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 Minuten Autopilot-Refresh
+const CACHE_TTL_MS = 10 * 60 * 1000;
 
 let memoryCache: IntelligenceSnapshot | null = null;
 let inflightRefresh: Promise<IntelligenceSnapshot> | null = null;
@@ -16,7 +17,10 @@ let inflightRefresh: Promise<IntelligenceSnapshot> | null = null;
 async function readDiskSnapshot(): Promise<IntelligenceSnapshot | null> {
   try {
     const raw = await fs.readFile(SNAPSHOT_FILE, "utf8");
-    return JSON.parse(raw) as IntelligenceSnapshot;
+    const parsed = JSON.parse(raw) as IntelligenceSnapshot;
+    // Invalidate older v1/v2 cache snapshots that predate the v3 Ontology schema
+    if (!parsed.ontology || !Array.isArray(parsed.sourceHealth)) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -27,7 +31,7 @@ async function writeDiskSnapshot(snapshot: IntelligenceSnapshot): Promise<void> 
     await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.writeFile(SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2), "utf8");
   } catch {
-    // Read-only serverless filesystem fallback (e.g. Vercel runtime) -> memory cache only
+    // Read-only serverless fallback
   }
 }
 
@@ -36,12 +40,13 @@ export async function refreshIntelligenceSnapshot(): Promise<IntelligenceSnapsho
 
   inflightRefresh = (async () => {
     try {
-      const [{ items, sourcesOnline }, markets] = await Promise.all([
+      const [{ items, sourcesOnline, sourceHealth }, markets] = await Promise.all([
         fetchLiveGeopoliticalFeeds(),
         fetchLiveMarkets(),
       ]);
 
       const events = clusterAndAnalyzeNews(items);
+      const ontology = buildOntologyGraph(events);
       const { index, label, regionalRisks } = computeGlobalRiskIndex(events);
       const briefing = await generateExecutiveBriefing(events, index);
 
@@ -52,8 +57,11 @@ export async function refreshIntelligenceSnapshot(): Promise<IntelligenceSnapsho
         globalRiskIndex: index,
         riskLabel: label,
         liveSourcesOnline: sourcesOnline,
+        totalSourcesConfigured: LIVE_FEEDS.length,
         totalArticlesScanned: items.length,
+        sourceHealth,
         events,
+        ontology,
         markets,
         regionalRisks,
         briefing,
@@ -109,7 +117,7 @@ export async function saveSubscriber(record: SubscriberRecord): Promise<{ totalS
     await fs.mkdir(DATA_DIR, { recursive: true });
     await fs.writeFile(SUBSCRIBERS_FILE, JSON.stringify(list, null, 2), "utf8");
   } catch {
-    // Graceful no-op on read-only FS
+    // Graceful no-op
   }
   return { totalSubscribers: list.length };
 }

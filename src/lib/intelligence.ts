@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { CATEGORY_RULES, GEO_ANCHORS } from "./geoData";
+import { extractEntitiesForText } from "./ontology";
 import type {
   CategoryKey,
   ExecutiveBriefing,
@@ -55,13 +56,13 @@ export function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
 
 export function isGeopoliticallyRelevant(title: string, description: string): boolean {
   const hay = `${title} ${description}`.toLowerCase();
-  // Filter obvious entertainment/sports/lifestyle noise
-  if (/(premier league|champions league|nba|nfl|oscars|grammy|box office|celebrity|recipe|horoscope|fashion week)/.test(hay)) {
+  if (/(premier league|champions league|bundesliga|nba|nfl|oscars|grammy|box office|celebrity|recipe|horoscope|fashion week|tatort|wetten)/.test(hay)) {
     return false;
   }
   const hasGeoAnchor = GEO_ANCHORS.some((a) => a.keywords.some((k) => hay.includes(k)));
   const hasCategoryKeyword = CATEGORY_RULES.some((r) => r.keywords.some((k) => hay.includes(k)));
-  return hasGeoAnchor || hasCategoryKeyword;
+  const hasEntity = extractEntitiesForText(hay).ids.length > 0;
+  return hasGeoAnchor || hasCategoryKeyword || hasEntity;
 }
 
 function classifyGeo(text: string) {
@@ -246,6 +247,8 @@ export function clusterAndAnalyzeNews(rawItems: RawNewsItem[]): GeoEvent[] {
       .update(`${lead.title}-${geo.countryOrZone}`)
       .digest("hex")
       .slice(0, 12);
+    const code = `EVT-${id.slice(0, 4).toUpperCase()}`;
+    const extracted = extractEntitiesForText(combinedText);
 
     const sources: SourceCitation[] = cluster.items.map((i) => ({
       sourceName: i.sourceName,
@@ -266,6 +269,7 @@ export function clusterAndAnalyzeNews(rawItems: RawNewsItem[]): GeoEvent[] {
 
     return {
       id,
+      code,
       headline: lead.title,
       summaryDe: cleanDesc
         ? `${cleanDesc}${cleanDesc.length >= 220 ? "…" : ""}`
@@ -294,6 +298,8 @@ export function clusterAndAnalyzeNews(rawItems: RawNewsItem[]): GeoEvent[] {
       publishedAt: lead.publishedAt,
       sources,
       marketImpacts,
+      entityIds: extracted.ids,
+      entityNames: extracted.names,
       tags,
     };
   });
@@ -305,7 +311,7 @@ export function clusterAndAnalyzeNews(rawItems: RawNewsItem[]): GeoEvent[] {
     return scoreB - scoreA;
   });
 
-  return events.slice(0, 28);
+  return events.slice(0, 36);
 }
 
 export function computeGlobalRiskIndex(events: GeoEvent[]): {
@@ -355,7 +361,7 @@ export async function generateExecutiveBriefing(events: GeoEvent[], globalRiskIn
   const top3 = events.slice(0, 3);
   const fallback: ExecutiveBriefing = {
     generatedAt: new Date().toISOString(),
-    mode: "ai-engine",
+    mode: "ontology-engine",
     headlineDe: `Globales Risiko bei ${globalRiskIndex}/100 — Fokus auf ${top3[0]?.countryOrZone ?? "Energie & Sicherheit"}`,
     headlineEn: `Global Risk at ${globalRiskIndex}/100 — Focus on ${top3[0]?.countryOrZone ?? "Energy & Security"}`,
     bulletsDe: top3.map(
