@@ -1,8 +1,13 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { geoDistance, geoGraticule10, geoNaturalEarth1, geoOrthographic, geoPath, type GeoPermissibleObjects } from "d3-geo";
+import { feature } from "topojson-client";
+import type { Topology, GeometryCollection } from "topojson-specification";
+import countriesAtlas from "world-atlas/countries-110m.json";
+import { Globe, Map as MapIcon, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { MARITIME_CHOKEPOINTS } from "@/lib/geoData";
-import type { GeoEvent } from "@/lib/types";
+import type { GeoEvent, RegionKey } from "@/lib/types";
 
 interface WorldMapProps {
   events: GeoEvent[];
@@ -11,93 +16,244 @@ interface WorldMapProps {
   lang: "de" | "en";
 }
 
-// Equirectangular projection onto 1000 x 500 SVG tactical canvas
-function project(lat: number, lng: number): { x: number; y: number } {
-  const x = ((lng + 180) / 360) * 1000;
-  const y = ((90 - lat) / 180) * 500;
-  return { x, y };
+interface CountryFeature {
+  type: "Feature";
+  id?: string | number;
+  properties: { name?: string };
+  geometry: GeoJSON.Geometry;
 }
 
-function severityColor(severity: number): string {
-  if (severity >= 75) return "#f43f5e"; // Crimson Critical
-  if (severity >= 55) return "#f59e0b"; // Amber Elevated
-  return "#22d3ee"; // Cyan Watch
-}
+type MapMode = "globe" | "flat";
 
-// Clean Natural-Earth inspired continental silhouettes (equirectangular 1000x500)
-const CONTINENT_PATHS = [
-  // North America
-  "M 62,72 L 128,58 L 195,55 L 240,76 L 290,94 L 298,125 L 268,148 L 245,172 L 222,195 L 208,214 L 185,204 L 160,185 L 138,162 L 114,132 L 76,105 Z",
-  // Greenland
-  "M 345,35 L 402,28 L 424,58 L 395,88 L 362,84 L 348,60 Z",
-  // South America
-  "M 225,222 L 265,216 L 308,242 L 342,276 L 336,318 L 310,362 L 284,412 L 268,424 L 254,394 L 246,348 L 234,296 L 218,256 Z",
-  // Europe
-  "M 455,108 L 488,82 L 530,68 L 575,66 L 598,84 L 590,118 L 566,134 L 542,140 L 518,144 L 490,148 L 466,142 L 456,125 Z",
-  // UK & Ireland
-  "M 456,96 L 470,92 L 474,110 L 458,114 Z",
-  // Africa
-  "M 452,162 L 502,154 L 552,160 L 588,186 L 618,216 L 610,255 L 586,298 L 566,342 L 538,365 L 514,344 L 500,298 L 484,262 L 450,242 L 434,205 Z",
-  // Madagascar
-  "M 604,298 L 616,294 L 614,326 L 602,324 Z",
-  // Middle East & Asia
-  "M 578,120 L 635,88 L 712,68 L 808,68 L 882,86 L 910,112 L 876,148 L 848,176 L 826,204 L 796,216 L 772,248 L 748,225 L 722,222 L 698,242 L 672,216 L 642,202 L 614,208 L 588,188 L 568,164 L 566,138 Z",
-  // Japan
-  "M 868,136 L 884,126 L 892,146 L 876,162 L 866,154 Z",
-  // Southeast Asia Islands (Indonesia / Philippines)
-  "M 776,256 L 818,262 L 846,270 L 842,282 L 792,276 L 770,268 Z",
-  "M 828,218 L 842,216 L 846,240 L 832,242 Z",
-  // Australia
-  "M 792,312 L 848,298 L 896,316 L 908,358 L 882,388 L 834,386 L 796,364 L 784,336 Z",
-  // New Zealand
-  "M 936,386 L 952,374 L 956,400 L 940,408 Z",
+const REGION_PRESETS: { label: string; region: "Global" | RegionKey; rotate: [number, number]; center: [number, number]; zoom: number }[] = [
+  { label: "Global", region: "Global", rotate: [-22, -20], center: [12, 18], zoom: 1.0 },
+  { label: "Middle East", region: "Middle East", rotate: [-46, -26], center: [46, 26], zoom: 2.35 },
+  { label: "Europe", region: "Europe", rotate: [-18, -50], center: [18, 50], zoom: 2.4 },
+  { label: "Indo-Pacific", region: "Indo-Pacific", rotate: [-112, -20], center: [112, 20], zoom: 2.0 },
+  { label: "Americas", region: "Americas", rotate: [82, -22], center: [-82, 22], zoom: 1.75 },
+  { label: "Africa", region: "Africa", rotate: [-20, -4], center: [20, 4], zoom: 1.9 },
 ];
 
+const MARITIME_CORRIDORS: GeoJSON.Feature<GeoJSON.LineString>[] = [
+  {
+    type: "Feature",
+    properties: {},
+    geometry: {
+      type: "LineString",
+      coordinates: [
+        [32.3, 30.6], // Suez
+        [43.3, 12.6], // Bab el-Mandeb
+        [56.2, 26.5], // Hormuz
+        [72.8, 18.9], // Arabian Sea
+        [101.2, 2.5], // Malacca
+        [119.5, 24.0], // Taiwan Strait
+      ],
+    },
+  },
+  {
+    type: "Feature",
+    properties: {},
+    geometry: {
+      type: "LineString",
+      coordinates: [
+        [-5.6, 36.0], // Gibraltar
+        [15.0, 35.5], // Central Med
+        [32.3, 30.6], // Suez
+      ],
+    },
+  },
+];
+
+function severityColor(severity: number): string {
+  if (severity >= 75) return "#f43f5e";
+  if (severity >= 55) return "#f59e0b";
+  return "#22d3ee";
+}
+
 export function WorldMap({ events, selectedEventId, onSelectEvent, lang }: WorldMapProps) {
-  const [hovered, setHovered] = useState<GeoEvent | null>(null);
+  const [mode, setMode] = useState<MapMode>("globe");
+  const [rotation, setRotation] = useState<[number, number]>([-28, -22]);
+  const [flatCenter, setFlatCenter] = useState<[number, number]>([12, 18]);
+  const [zoom, setZoom] = useState<number>(1.0);
+  const [autoSpin, setAutoSpin] = useState<boolean>(true);
+  const [hoveredEvent, setHoveredEvent] = useState<GeoEvent | null>(null);
+  const [hoveredCountry, setHoveredCountry] = useState<string | null>(null);
   const [hoveredChoke, setHoveredChoke] = useState<string | null>(null);
 
+  const dragRef = useRef<{ active: boolean; x: number; y: number } | null>(null);
+
+  // Extract real Natural-Earth 110m country polygons from TopoJSON once
+  const countries = useMemo<CountryFeature[]>(() => {
+    const topo = countriesAtlas as unknown as Topology<{ countries: GeometryCollection<{ name?: string }> }>;
+    const fc = feature(topo, topo.objects.countries) as unknown as { features: CountryFeature[] };
+    return fc.features;
+  }, []);
+
+  const graticule = useMemo(() => geoGraticule10(), []);
+
+  // Gentle 3D globe rotation until user interacts
+  useEffect(() => {
+    if (mode !== "globe" || !autoSpin) return;
+    const id = setInterval(() => {
+      setRotation(([lon, lat]) => [((lon - 0.28 + 540) % 360) - 180, lat]);
+    }, 50);
+    return () => clearInterval(id);
+  }, [mode, autoSpin]);
+
+  const width = 960;
+  const height = 490;
+
+  const projection = useMemo(() => {
+    if (mode === "globe") {
+      return geoOrthographic()
+        .scale(215 * zoom)
+        .translate([width / 2, height / 2])
+        .rotate([rotation[0], rotation[1], 0])
+        .clipAngle(90);
+    }
+    return geoNaturalEarth1()
+      .scale(178 * zoom)
+      .translate([width / 2, height / 2 + 12])
+      .center(flatCenter);
+  }, [mode, rotation, flatCenter, zoom]);
+
+  const pathGen = useMemo(() => geoPath(projection), [projection]);
+
+  const isVisibleOnGlobe = (lng: number, lat: number): boolean => {
+    if (mode !== "globe") return true;
+    const centerGeo: [number, number] = [-rotation[0], -rotation[1]];
+    return geoDistance([lng, lat], centerGeo) < Math.PI / 2 - 0.04;
+  };
+
+  const focusPreset = (preset: (typeof REGION_PRESETS)[number]) => {
+    setAutoSpin(false);
+    setRotation(preset.rotate);
+    setFlatCenter(preset.center);
+    setZoom(mode === "globe" ? Math.min(1.65, Math.max(1.0, preset.zoom * 0.72)) : preset.zoom);
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    dragRef.current = { active: true, x: e.clientX, y: e.clientY };
+    setAutoSpin(false);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!dragRef.current?.active) return;
+    const dx = e.clientX - dragRef.current.x;
+    const dy = e.clientY - dragRef.current.y;
+    dragRef.current = { active: true, x: e.clientX, y: e.clientY };
+
+    if (mode === "globe") {
+      setRotation(([lon, lat]) => [lon + dx * 0.42, Math.max(-68, Math.min(68, lat - dy * 0.38))]);
+    } else {
+      setFlatCenter(([lon, lat]) => [
+        Math.max(-160, Math.min(160, lon - (dx * 0.35) / zoom)),
+        Math.max(-60, Math.min(72, lat + (dy * 0.35) / zoom)),
+      ]);
+    }
+  };
+
+  const handlePointerUp = () => {
+    dragRef.current = null;
+  };
+
   return (
-    <div className="relative w-full overflow-hidden rounded-2xl border border-slate-800/80 bg-[#070d18] shadow-[0_0_60px_rgba(6,182,212,0.06)]">
-      {/* Top tactical HUD overlay */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-2 rounded-full border border-cyan-500/25 bg-slate-950/80 px-3 py-1 backdrop-blur-md">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
-          <span className="font-mono text-[11px] font-semibold tracking-widest text-cyan-300 uppercase">
-            {lang === "de" ? "LIVE GEOPOLITIK-RADAR · ECHTZEIT-HOTSPOTS" : "LIVE GEOPOLITICAL RADAR · GLOBAL HOTSPOTS"}
-          </span>
+    <div className="relative w-full overflow-hidden rounded-2xl border border-slate-800/80 bg-[#060c18] shadow-[0_0_70px_rgba(6,182,212,0.08)]">
+      {/* Top Interactive Map Controls Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/85 px-3.5 py-2.5">
+        <div className="flex items-center gap-1.5">
+          <div className="flex rounded-lg border border-slate-800 bg-slate-900/90 p-0.5 font-mono text-[11px]">
+            <button
+              onClick={() => {
+                setMode("globe");
+                setZoom(1.0);
+              }}
+              className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition ${
+                mode === "globe" ? "bg-cyan-500/20 font-bold text-cyan-300" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Globe className="h-3.5 w-3.5" /> 3D Globe
+            </button>
+            <button
+              onClick={() => {
+                setMode("flat");
+                setZoom(1.0);
+                setFlatCenter([12, 18]);
+              }}
+              className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition ${
+                mode === "flat" ? "bg-cyan-500/20 font-bold text-cyan-300" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <MapIcon className="h-3.5 w-3.5" /> {lang === "de" ? "Weltkarte" : "Tactical Map"}
+            </button>
+          </div>
+
+          <div className="hidden items-center gap-1 md:flex">
+            {REGION_PRESETS.map((p) => (
+              <button
+                key={p.label}
+                onClick={() => focusPreset(p)}
+                className="rounded-md border border-slate-800/80 bg-slate-900/60 px-2 py-1 font-mono text-[10px] text-slate-300 transition hover:border-cyan-500/40 hover:text-cyan-300"
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="hidden items-center gap-3 rounded-full border border-slate-800/90 bg-slate-950/80 px-3 py-1 font-mono text-[10px] text-slate-400 backdrop-blur-md sm:flex">
-          <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-rose-500" /> {lang === "de" ? "Kritisch (75+)" : "Critical (75+)"}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-amber-400" /> {lang === "de" ? "Erhöht (55+)" : "Elevated (55+)"}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-cyan-400" /> {lang === "de" ? "Beobachtung" : "Watch"}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block h-2 w-2 rotate-45 border border-emerald-400 bg-emerald-400/30" /> Chokepoint
-          </span>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setZoom((z) => Math.min(3.5, Number((z + 0.35).toFixed(2))))}
+            className="rounded-md border border-slate-800 bg-slate-900/90 p-1.5 text-slate-300 hover:border-cyan-500/50 hover:text-cyan-300"
+            title="Zoom In"
+          >
+            <ZoomIn className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => setZoom((z) => Math.max(0.85, Number((z - 0.35).toFixed(2))))}
+            className="rounded-md border border-slate-800 bg-slate-900/90 p-1.5 text-slate-300 hover:border-cyan-500/50 hover:text-cyan-300"
+            title="Zoom Out"
+          >
+            <ZoomOut className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => {
+              setZoom(1.0);
+              setRotation([-28, -22]);
+              setFlatCenter([12, 18]);
+              setAutoSpin(mode === "globe");
+            }}
+            className="rounded-md border border-slate-800 bg-slate-900/90 p-1.5 text-slate-300 hover:border-cyan-500/50 hover:text-cyan-300"
+            title="Reset View"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
 
-      {/* SVG Tactical World Map */}
+      {/* Real Natural-Earth d3-geo Interactive SVG Canvas */}
       <svg
-        viewBox="0 0 1000 470"
-        className="h-[340px] w-full select-none sm:h-[420px] lg:h-[465px]"
+        viewBox={`0 0 ${width} ${height}`}
+        className="h-[360px] w-full cursor-grab select-none active:cursor-grabbing sm:h-[440px] lg:h-[485px]"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerUp}
         role="img"
-        aria-label="Global Geopolitical Hotspots Map"
+        aria-label="Interactive Geopolitical World Map"
       >
         <defs>
-          <radialGradient id="oceanGlow" cx="50%" cy="46%" r="65%">
-            <stop offset="0%" stopColor="#0b1729" />
-            <stop offset="100%" stopColor="#040811" />
+          <radialGradient id="spaceBg" cx="50%" cy="50%" r="60%">
+            <stop offset="0%" stopColor="#091529" />
+            <stop offset="100%" stopColor="#04070e" />
           </radialGradient>
-          <filter id="neonGlow" x="-40%" y="-40%" width="180%" height="180%">
-            <feGaussianBlur stdDeviation="2.5" result="blur" />
+          <radialGradient id="globeSphere" cx="38%" cy="34%" r="68%">
+            <stop offset="0%" stopColor="#0e223d" />
+            <stop offset="70%" stopColor="#071122" />
+            <stop offset="100%" stopColor="#030711" />
+          </radialGradient>
+          <filter id="beaconGlow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="2.8" result="blur" />
             <feMerge>
               <feMergeNode in="blur" />
               <feMergeNode in="SourceGraphic" />
@@ -105,88 +261,90 @@ export function WorldMap({ events, selectedEventId, onSelectEvent, lang }: World
           </filter>
         </defs>
 
-        <rect width="1000" height="470" fill="url(#oceanGlow)" />
+        <rect width={width} height={height} fill="url(#spaceBg)" />
 
-        {/* Graticule gridlines */}
-        {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((i) => (
-          <line
-            key={`v-${i}`}
-            x1={i * 100}
-            y1={0}
-            x2={i * 100}
-            y2={470}
-            stroke="rgba(56, 189, 248, 0.06)"
-            strokeWidth="1"
+        {/* Globe atmospheric sphere halo */}
+        {mode === "globe" && (
+          <path
+            d={pathGen({ type: "Sphere" }) || ""}
+            fill="url(#globeSphere)"
+            stroke="rgba(34, 211, 238, 0.35)"
+            strokeWidth="1.5"
           />
-        ))}
-        {[1, 2, 3, 4].map((i) => (
-          <line
-            key={`h-${i}`}
-            x1={0}
-            y1={i * 94}
-            x2={1000}
-            y2={i * 94}
-            stroke="rgba(56, 189, 248, 0.06)"
-            strokeWidth="1"
-            strokeDasharray={i === 2 ? "4 4" : undefined}
-          />
-        ))}
+        )}
 
-        {/* Strategic Maritime Trade Corridor Arcs */}
+        {/* Geodesic Graticule */}
         <path
-          d="M 590,192 Q 618,220 656,178 T 782,243 T 832,184"
+          d={pathGen(graticule) || ""}
           fill="none"
-          stroke="rgba(16, 185, 129, 0.22)"
-          strokeWidth="1.2"
-          strokeDasharray="4 4"
-        />
-        <path
-          d="M 480,145 Q 535,165 590,192"
-          fill="none"
-          stroke="rgba(16, 185, 129, 0.2)"
-          strokeWidth="1.2"
-          strokeDasharray="4 4"
+          stroke="rgba(56, 189, 248, 0.08)"
+          strokeWidth="0.7"
         />
 
-        {/* Continents */}
+        {/* Real 110m Country Polygons */}
         <g>
-          {CONTINENT_PATHS.map((d, idx) => (
+          {countries.map((c, idx) => {
+            const d = pathGen(c as unknown as GeoPermissibleObjects);
+            if (!d) return null;
+            const cName = c.properties?.name ?? "";
+            const isHov = hoveredCountry === cName && cName !== "";
+            return (
+              <path
+                key={c.id ?? idx}
+                d={d}
+                fill={isHov ? "#173154" : "#0e1d34"}
+                stroke={isHov ? "rgba(56, 189, 248, 0.7)" : "rgba(56, 189, 248, 0.24)"}
+                strokeWidth={isHov ? 1.1 : 0.65}
+                onMouseEnter={() => setHoveredCountry(cName || null)}
+                onMouseLeave={() => setHoveredCountry(null)}
+              />
+            );
+          })}
+        </g>
+
+        {/* Maritime Geodesic Trade Corridors */}
+        {MARITIME_CORRIDORS.map((corridor, idx) => {
+          const d = pathGen(corridor);
+          if (!d) return null;
+          return (
             <path
               key={idx}
               d={d}
-              fill="#0e1b30"
-              stroke="rgba(56, 189, 248, 0.26)"
-              strokeWidth="1.15"
-              className="transition-colors duration-300 hover:fill-[#132541]"
+              fill="none"
+              stroke="rgba(16, 185, 129, 0.42)"
+              strokeWidth="1.4"
+              strokeDasharray="4 4"
             />
-          ))}
-        </g>
+          );
+        })}
 
-        {/* Maritime Chokepoints */}
+        {/* Maritime Chokepoint Diamonds */}
         {MARITIME_CHOKEPOINTS.map((cp) => {
-          const { x, y } = project(cp.lat, cp.lng);
+          if (!isVisibleOnGlobe(cp.lng, cp.lat)) return null;
+          const pt = projection([cp.lng, cp.lat]);
+          if (!pt) return null;
           const active = hoveredChoke === cp.id;
           return (
             <g
               key={cp.id}
-              transform={`translate(${x}, ${y})`}
+              transform={`translate(${pt[0]}, ${pt[1]})`}
               className="cursor-pointer"
               onMouseEnter={() => setHoveredChoke(cp.id)}
               onMouseLeave={() => setHoveredChoke(null)}
             >
               <rect
-                x={-4.5}
-                y={-4.5}
-                width={9}
-                height={9}
+                x={-4.2}
+                y={-4.2}
+                width={8.4}
+                height={8.4}
                 transform="rotate(45)"
-                fill={cp.baseRisk === "HIGH" ? "rgba(244,63,94,0.35)" : "rgba(16,185,129,0.28)"}
+                fill={cp.baseRisk === "HIGH" ? "rgba(244,63,94,0.35)" : "rgba(16,185,129,0.32)"}
                 stroke={cp.baseRisk === "HIGH" ? "#fb7185" : "#34d399"}
                 strokeWidth="1.2"
               />
               {active && (
-                <g transform="translate(10, -16)">
-                  <rect x={0} y={0} width={170} height={36} rx={6} fill="#020617" fillOpacity={0.94} stroke="rgba(52,211,153,0.45)" />
+                <g transform="translate(10, -18)">
+                  <rect x={0} y={0} width={178} height={36} rx={6} fill="#020617" fillOpacity={0.95} stroke="rgba(52,211,153,0.5)" />
                   <text x={8} y={14} fill="#6ee7b7" fontSize="9.5" fontFamily="monospace" fontWeight="bold">
                     {cp.name}
                   </text>
@@ -201,80 +359,69 @@ export function WorldMap({ events, selectedEventId, onSelectEvent, lang }: World
 
         {/* Live Geopolitical Event Hotspots */}
         {events.map((ev) => {
-          const { x, y } = project(ev.lat, ev.lng);
+          if (!isVisibleOnGlobe(ev.lng, ev.lat)) return null;
+          const pt = projection([ev.lng, ev.lat]);
+          if (!pt) return null;
           const color = severityColor(ev.severity);
           const isSelected = ev.id === selectedEventId;
-          const baseRadius = ev.severity >= 75 ? 6.2 : ev.severity >= 55 ? 5.0 : 4.2;
+          const r = ev.severity >= 75 ? 6.0 : ev.severity >= 55 ? 4.8 : 4.0;
 
           return (
             <g
               key={ev.id}
-              transform={`translate(${x}, ${y})`}
+              transform={`translate(${pt[0]}, ${pt[1]})`}
               className="cursor-pointer"
-              onClick={() => onSelectEvent(ev)}
-              onMouseEnter={() => setHovered(ev)}
-              onMouseLeave={() => setHovered(null)}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectEvent(ev);
+              }}
+              onMouseEnter={() => setHoveredEvent(ev)}
+              onMouseLeave={() => setHoveredEvent(null)}
             >
-              {/* Animated radar pulse for elevated/critical hotspots */}
               {ev.severity >= 55 && (
-                <circle
-                  r={baseRadius + 4}
-                  fill="none"
-                  stroke={color}
-                  strokeWidth="1.4"
-                  className="radar-pulse"
-                />
+                <circle r={r + 4} fill="none" stroke={color} strokeWidth="1.4" className="radar-pulse" />
               )}
-
-              {/* Selection ring */}
               {isSelected && (
-                <circle r={baseRadius + 7} fill="none" stroke="#ffffff" strokeWidth="1.5" strokeDasharray="3 2" />
+                <circle r={r + 7} fill="none" stroke="#ffffff" strokeWidth="1.5" strokeDasharray="3 2" />
               )}
-
-              <circle
-                r={baseRadius}
-                fill={color}
-                fillOpacity={0.9}
-                stroke="#020617"
-                strokeWidth="1.5"
-                filter="url(#neonGlow)"
-              />
+              <circle r={r} fill={color} fillOpacity={0.92} stroke="#020617" strokeWidth="1.4" filter="url(#beaconGlow)" />
             </g>
           );
         })}
       </svg>
 
-      {/* Bottom Hover Intelligence Bar */}
-      <div className="flex min-h-[46px] items-center justify-between border-t border-slate-800/80 bg-slate-950/90 px-4 py-2 text-xs">
-        {hovered ? (
-          <div className="flex flex-wrap items-center gap-2.5">
+      {/* Bottom Telemetry & Hover Bar */}
+      <div className="flex min-h-[46px] flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 bg-slate-950/90 px-4 py-2 text-xs">
+        {hoveredEvent ? (
+          <div className="flex flex-wrap items-center gap-2">
             <span
               className="rounded px-1.5 py-0.5 font-mono text-[10px] font-bold"
               style={{
-                backgroundColor: `${severityColor(hovered.severity)}22`,
-                color: severityColor(hovered.severity),
-                border: `1px solid ${severityColor(hovered.severity)}55`,
+                backgroundColor: `${severityColor(hoveredEvent.severity)}22`,
+                color: severityColor(hoveredEvent.severity),
+                border: `1px solid ${severityColor(hoveredEvent.severity)}55`,
               }}
             >
-              SEV {hovered.severity}/100
+              SEV {hoveredEvent.severity}/100
             </span>
-            <span className="font-mono text-[11px] font-semibold text-cyan-300">{hovered.countryOrZone}</span>
-            <span className="line-clamp-1 max-w-xl text-slate-200">{hovered.headline}</span>
-            {hovered.marketImpacts[0] && (
-              <span className="rounded bg-slate-800/90 px-2 py-0.5 font-mono text-[10px] text-emerald-300">
-                {hovered.marketImpacts[0].ticker} · {hovered.marketImpacts[0].direction.toUpperCase()}
-              </span>
-            )}
+            <span className="font-mono text-[11px] font-semibold text-cyan-300">{hoveredEvent.countryOrZone}</span>
+            <span className="line-clamp-1 max-w-lg text-slate-200">{hoveredEvent.headline}</span>
           </div>
         ) : (
           <div className="flex w-full items-center justify-between text-slate-400">
             <span className="font-mono text-[11px]">
-              {lang === "de"
-                ? "Klicke auf einen Hotspot für KI-Dossier, Quellen-Check & Markt-Signale."
-                : "Click any hotspot beacon for AI Dossier, Source Verification & Market Signals."}
+              {hoveredCountry
+                ? `${lang === "de" ? "Territorium" : "Territory"}: ${hoveredCountry}`
+                : mode === "globe"
+                ? lang === "de"
+                  ? "3D-Globus ziehen zum Drehen · Klicke auf einen Hotspot für das KI-Dossier."
+                  : "Drag 3D Globe to rotate · Click any hotspot beacon for AI Dossier."
+                : lang === "de"
+                ? "Ziehen zum Verschieben · Zoom & Regionen-Buttons oben nutzbar."
+                : "Drag to pan · Use Zoom & Region focus buttons above."}
             </span>
             <span className="hidden font-mono text-[10px] text-slate-500 sm:inline">
-              {events.length} {lang === "de" ? "aktive Ereignisse auf Karte" : "active beacons plotted"}
+              Natural Earth 110m · {events.length} {lang === "de" ? "Hotspots" : "beacons"}
             </span>
           </div>
         )}

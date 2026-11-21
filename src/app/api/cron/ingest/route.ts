@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
+import { dispatchBreakingAlerts } from "@/lib/alerts";
 import { refreshIntelligenceSnapshot } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Vollautomatischer Vercel-Cron / Background-Ingestion-Endpoint (alle 15 Min.).
- * Zieht live RSS-Feeds + Yahoo-Marktdaten, clustert Events, berechnet Risk-Index & KI-Briefing.
+ * Vollautomatischer Vercel-Cron-Endpoint (alle 15 Min.):
+ * Zieht live RSS-Feeds + Yahoo-Marktdaten, clustert Events, berechnet Risk-Index
+ * und sendet bei kritischen Eskalationen (Severity >= 78) automatisch Telegram- & Pro-E-Mail-Alerts!
  */
 export async function GET(request: NextRequest) {
   const secret = process.env.CRON_SECRET?.trim();
@@ -17,11 +19,13 @@ export async function GET(request: NextRequest) {
   }
 
   const snapshot = await refreshIntelligenceSnapshot();
+  const alerts = await dispatchBreakingAlerts(snapshot);
   return NextResponse.json({
     ok: true,
     generatedAt: snapshot.generatedAt,
     globalRiskIndex: snapshot.globalRiskIndex,
     eventsCount: snapshot.events.length,
     liveSourcesOnline: snapshot.liveSourcesOnline,
+    alerts,
   });
 }
