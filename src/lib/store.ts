@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fetchLiveGeopoliticalFeeds, LIVE_FEEDS } from "./ingestion";
+import { getAllAnnotations, getArchiveCount, getCustomFeeds, getCustomTickers, getRiskHistory, recordIngestToDb } from "./db";
+import { fetchLiveGeopoliticalFeeds } from "./ingestion";
 import { clusterAndAnalyzeNews, computeGlobalRiskIndex, generateExecutiveBriefing } from "./intelligence";
 import { fetchLiveMarkets } from "./markets";
 import { buildOntologyGraph } from "./ontology";
@@ -8,30 +9,30 @@ import type { IntelligenceSnapshot } from "./types";
 
 const DATA_DIR = path.join(process.cwd(), ".geopulse-data");
 const SNAPSHOT_FILE = path.join(DATA_DIR, "snapshot.json");
-const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
 let memoryCache: IntelligenceSnapshot | null = null;
 let inflightRefresh: Promise<IntelligenceSnapshot> | null = null;
 
+function hydrateLocalMetadata(snapshot: IntelligenceSnapshot): IntelligenceSnapshot {
+  return {
+    ...snapshot,
+    riskHistory: getRiskHistory(48),
+    archiveCount: getArchiveCount(),
+    annotations: getAllAnnotations(),
+    customFeeds: getCustomFeeds(),
+    customTickers: getCustomTickers(),
+  };
+}
+
 async function readDiskSnapshot(): Promise<IntelligenceSnapshot | null> {
   try {
     const raw = await fs.readFile(SNAPSHOT_FILE, "utf8");
     const parsed = JSON.parse(raw) as IntelligenceSnapshot;
-    // Invalidate older v1/v2 cache snapshots that predate the v3 Ontology schema
     if (!parsed.ontology || !Array.isArray(parsed.sourceHealth)) return null;
     return parsed;
   } catch {
     return null;
-  }
-}
-
-async function writeDiskSnapshot(snapshot: IntelligenceSnapshot): Promise<void> {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2), "utf8");
-  } catch {
-    // Read-only serverless fallback
   }
 }
 
@@ -40,7 +41,7 @@ export async function refreshIntelligenceSnapshot(): Promise<IntelligenceSnapsho
 
   inflightRefresh = (async () => {
     try {
-      const [{ items, sourcesOnline, sourceHealth }, markets] = await Promise.all([
+      const [{ items, sourcesOnline, totalConfigured, sourceHealth }, markets] = await Promise.all([
         fetchLiveGeopoliticalFeeds(),
         fetchLiveMarkets(),
       ]);
@@ -50,14 +51,17 @@ export async function refreshIntelligenceSnapshot(): Promise<IntelligenceSnapsho
       const { index, label, regionalRisks } = computeGlobalRiskIndex(events);
       const briefing = await generateExecutiveBriefing(events, index);
 
+      // Persist full snapshot + event archive into local SQLite database
+      recordIngestToDb(index, sourcesOnline, items.length, events);
+
       const now = Date.now();
-      const snapshot: IntelligenceSnapshot = {
+      const base: IntelligenceSnapshot = {
         generatedAt: new Date(now).toISOString(),
         nextAutoSyncAt: new Date(now + CACHE_TTL_MS).toISOString(),
         globalRiskIndex: index,
         riskLabel: label,
         liveSourcesOnline: sourcesOnline,
-        totalSourcesConfigured: LIVE_FEEDS.length,
+        totalSourcesConfigured: totalConfigured,
         totalArticlesScanned: items.length,
         sourceHealth,
         events,
@@ -65,11 +69,21 @@ export async function refreshIntelligenceSnapshot(): Promise<IntelligenceSnapsho
         markets,
         regionalRisks,
         briefing,
+        riskHistory: getRiskHistory(48),
+        archiveCount: getArchiveCount(),
+        annotations: getAllAnnotations(),
+        customFeeds: getCustomFeeds(),
+        customTickers: getCustomTickers(),
       };
 
-      memoryCache = snapshot;
-      await writeDiskSnapshot(snapshot);
-      return snapshot;
+      memoryCache = base;
+      try {
+        await fs.mkdir(DATA_DIR, { recursive: true });
+        await fs.writeFile(SNAPSHOT_FILE, JSON.stringify(base, null, 2), "utf8");
+      } catch {
+        // Ignore write error
+      }
+      return base;
     } finally {
       inflightRefresh = null;
     }
@@ -85,39 +99,9 @@ export async function getIntelligenceSnapshot(forceRefresh = false): Promise<Int
       memoryCache = candidate;
       const age = Date.now() - new Date(candidate.generatedAt).getTime();
       if (age < CACHE_TTL_MS && candidate.events.length > 0) {
-        return candidate;
+        return hydrateLocalMetadata(candidate);
       }
     }
   }
   return refreshIntelligenceSnapshot();
-}
-
-export interface SubscriberRecord {
-  email: string;
-  minSeverity: number;
-  regions: string[];
-  plan: "free-briefing" | "pro-alerts";
-  createdAt: string;
-}
-
-export async function saveSubscriber(record: SubscriberRecord): Promise<{ totalSubscribers: number }> {
-  let list: SubscriberRecord[] = [];
-  try {
-    const raw = await fs.readFile(SUBSCRIBERS_FILE, "utf8");
-    list = JSON.parse(raw) as SubscriberRecord[];
-  } catch {
-    list = [];
-  }
-
-  const idx = list.findIndex((s) => s.email.toLowerCase() === record.email.toLowerCase());
-  if (idx >= 0) list[idx] = record;
-  else list.push(record);
-
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(SUBSCRIBERS_FILE, JSON.stringify(list, null, 2), "utf8");
-  } catch {
-    // Graceful no-op
-  }
-  return { totalSubscribers: list.length };
 }

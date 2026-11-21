@@ -3,31 +3,38 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ArrowUpRight,
+  Bookmark,
   Database,
+  Download,
+  FileText,
   Globe2,
+  History,
   Network,
   Radio,
   RefreshCw,
+  Save,
   Search,
+  Settings,
   Table2,
   Terminal,
 } from "lucide-react";
 import type {
+  AnalystAnnotation,
   GeoEvent,
   IntelligenceSnapshot,
   OntologyEntity,
   OntologyNode,
   RegionKey,
 } from "@/lib/types";
+import { LocalConfigModal } from "./LocalConfigModal";
 import { OntologyGraphView } from "./OntologyGraph";
-import { ProAlertsModal } from "./ProAlertsModal";
 import { WorldMap } from "./WorldMap";
 
 interface GeoPulseTerminalProps {
   initialSnapshot: IntelligenceSnapshot;
 }
 
-type CenterView = "graph" | "geo" | "matrix";
+type CenterView = "graph" | "geo" | "matrix" | "archive";
 type ExplorerTab = "events" | "entities" | "sources";
 
 type InspectorTarget =
@@ -50,22 +57,54 @@ function severityBadgeClass(sev: number): string {
 
 export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
   const [snapshot, setSnapshot] = useState<IntelligenceSnapshot>(initialSnapshot);
+  const [annotations, setAnnotations] = useState<Record<string, AnalystAnnotation>>(initialSnapshot.annotations ?? {});
   const [lang, setLang] = useState<"de" | "en">("de");
   const [centerView, setCenterView] = useState<CenterView>("graph");
   const [explorerTab, setExplorerTab] = useState<ExplorerTab>("events");
   const [regionFilter, setRegionFilter] = useState<"ALL" | RegionKey>("ALL");
+  const [pinnedOnly, setPinnedOnly] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [syncing, setSyncing] = useState(false);
-  const [alertsOpen, setAlertsOpen] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
 
   const [inspector, setInspector] = useState<InspectorTarget | null>(() =>
     initialSnapshot.events[0] ? { kind: "EVENT", event: initialSnapshot.events[0] } : null
   );
 
-  // Analyst Console state inside docked Right Inspector
+  // Local SQLite Archive state
+  const [archiveEvents, setArchiveEvents] = useState<GeoEvent[]>([]);
+  const [archiveQuery, setArchiveQuery] = useState("");
+
+  // Full Dispatch Reader state
+  const [articleReader, setArticleReader] = useState<{ title: string; text: string; loading: boolean } | null>(null);
+
+  // Analyst Note state
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSavedFlash, setNoteSavedFlash] = useState(false);
+
+  // Analyst Query Console state
   const [consoleInput, setConsoleInput] = useState("");
   const [consoleOutput, setConsoleOutput] = useState<string | null>(null);
   const [consoleBusy, setConsoleBusy] = useState(false);
+
+  const currentObjectId = useMemo(() => {
+    if (!inspector) return null;
+    if (inspector.kind === "EVENT") return inspector.event.code;
+    if (inspector.kind === "ENTITY") return inspector.entity.id;
+    if (inspector.kind === "ASSET") return `AST-${inspector.ticker}`;
+    if (inspector.kind === "CHOKEPOINT") return `CHK-${inspector.name.toUpperCase().replace(/[^A-Z0-9]+/g, "_").slice(0, 12)}`;
+    return null;
+  }, [inspector]);
+
+  useEffect(() => {
+    if (!currentObjectId) {
+      setNoteDraft("");
+      return;
+    }
+    setNoteDraft(annotations[currentObjectId]?.note ?? "");
+    setArticleReader(null);
+    setConsoleOutput(null);
+  }, [currentObjectId, annotations]);
 
   const syncNow = async (force = true) => {
     setSyncing(true);
@@ -74,9 +113,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
       if (res.ok) {
         const fresh = (await res.json()) as IntelligenceSnapshot;
         setSnapshot(fresh);
-        if (fresh.events[0]) {
-          setInspector({ kind: "EVENT", event: fresh.events[0] });
-        }
+        setAnnotations(fresh.annotations ?? {});
       }
     } finally {
       setSyncing(false);
@@ -90,31 +127,81 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (centerView !== "archive") return;
+    fetch(`/api/archive?q=${encodeURIComponent(archiveQuery)}&limit=100`)
+      .then((r) => r.json())
+      .then((d) => setArchiveEvents(d.events ?? []))
+      .catch(() => {});
+  }, [centerView, archiveQuery, snapshot.generatedAt]);
+
   const filteredEvents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return snapshot.events.filter((ev) => {
       if (regionFilter !== "ALL" && ev.region !== regionFilter) return false;
+      if (pinnedOnly && !annotations[ev.code]?.pinned) return false;
       if (q) {
         const hay = `${ev.code} ${ev.headline} ${ev.countryOrZone} ${ev.entityNames.join(" ")} ${ev.marketImpacts.map((m) => m.ticker).join(" ")}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [snapshot.events, regionFilter, searchQuery]);
+  }, [snapshot.events, regionFilter, pinnedOnly, annotations, searchQuery]);
 
-  const selectedGraphNodeId = useMemo(() => {
-    if (!inspector) return null;
-    if (inspector.kind === "EVENT") return inspector.event.code;
-    if (inspector.kind === "ENTITY") return inspector.entity.id;
-    if (inspector.kind === "ASSET") return `AST-${inspector.ticker}`;
-    if (inspector.kind === "CHOKEPOINT") {
-      return `CHK-${inspector.name.toUpperCase().replace(/[^A-Z0-9]+/g, "_").slice(0, 12)}`;
+  const persistAnnotation = async (objectId: string, note: string, pinned: boolean) => {
+    const res = await fetch("/api/annotations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objectId, note, pinned }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setAnnotations((prev) => ({ ...prev, [objectId]: data.annotation }));
+      setNoteSavedFlash(true);
+      setTimeout(() => setNoteSavedFlash(false), 1800);
     }
-    return null;
-  }, [inspector]);
+  };
+
+  const fetchFullArticle = async (title: string, url: string) => {
+    setArticleReader({ title, text: "", loading: true });
+    try {
+      const res = await fetch(`/api/article?url=${encodeURIComponent(url)}`);
+      const data = await res.json();
+      setArticleReader({ title, text: data.text || data.error || "Kein Volltext verfügbar.", loading: false });
+    } catch {
+      setArticleReader({ title, text: "Fehler beim Abruf des Volltexts.", loading: false });
+    }
+  };
+
+  const exportDossierMarkdown = () => {
+    if (!inspector || !currentObjectId) return;
+    const note = annotations[currentObjectId]?.note ?? "";
+    let md = `# GEOPULSE INTELLIGENCE DOSSIER — ${currentObjectId}\nGenerated: ${new Date().toISOString()}\n\n`;
+
+    if (inspector.kind === "EVENT") {
+      const ev = inspector.event;
+      md += `## ${ev.headline}\n- **Region:** ${ev.region} (${ev.countryOrZone})\n- **Severity:** ${ev.severity}/100 (Confidence ${ev.confidenceScore}%)\n- **Category:** ${ev.category}\n- **Entities:** ${ev.entityNames.join(", ") || "N/A"}\n\n### Synthesis\n${ev.summaryDe}\n\n### Strategic Significance\n${ev.whyItMattersDe}\n\n### 72h Watchpoint\n${ev.watchpoint72hDe}\n\n### Market Transmission Vectors\n${ev.marketImpacts.map((m) => `- **${m.ticker}** (${m.sector}): ${m.direction.toUpperCase()} (${m.confidence}%) — ${m.rationaleDe}`).join("\n")}\n\n### Corroborating Dispatches\n${ev.sources.map((s) => `- [${s.sourceName} (${s.perspective})](${s.url}): ${s.title}`).join("\n")}\n`;
+    } else if (inspector.kind === "ENTITY") {
+      const ent = inspector.entity;
+      md += `## ${ent.name} (${ent.entityType})\n- **Region:** ${ent.region}\n- **Max Severity:** ${ent.maxSeverity}/100\n- **Exposed Tickers:** ${ent.linkedAssetTickers.join(", ")}\n`;
+    } else if (inspector.kind === "ASSET") {
+      md += `## Market Instrument: ${inspector.ticker} (${inspector.label})\n`;
+    }
+
+    if (note) {
+      md += `\n### Personal Analyst Notes\n${note}\n`;
+    }
+
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `geopulse-${currentObjectId.toLowerCase()}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleSelectGraphNode = (node: OntologyNode) => {
-    setConsoleOutput(null);
     if (node.kind === "EVENT") {
       const ev = snapshot.events.find((e) => e.code === node.id);
       if (ev) setInspector({ kind: "EVENT", event: ev });
@@ -122,8 +209,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
       const ent = snapshot.ontology.entities.find((e) => e.id === node.id);
       if (ent) setInspector({ kind: "ENTITY", entity: ent });
     } else if (node.kind === "ASSET") {
-      const ticker = node.label;
-      setInspector({ kind: "ASSET", ticker, label: node.sublabel });
+      setInspector({ kind: "ASSET", ticker: node.label, label: node.sublabel });
     } else if (node.kind === "CHOKEPOINT") {
       setInspector({ kind: "CHOKEPOINT", name: node.label });
     }
@@ -150,7 +236,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
         body: JSON.stringify({ eventId: targetEventId, question: q, lang }),
       });
       const data = await res.json();
-      setConsoleOutput(data.answer || data.error || "No response.");
+      setConsoleOutput(`[${data.mode ?? "engine"}]\n${data.answer || data.error || "No response."}`);
     } catch {
       setConsoleOutput("Query transport error.");
     } finally {
@@ -158,24 +244,25 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
     }
   };
 
+  const isCurrentPinned = currentObjectId ? Boolean(annotations[currentObjectId]?.pinned) : false;
+
   return (
     <div className="flex min-h-screen flex-col bg-[#0a0c10] text-[#d7dde8]">
-      {/* 1. Primary Command Header (Palantir Gotham Matte Chrome) */}
+      {/* 1. Matte Workstation Command Bar */}
       <header className="flex h-11 shrink-0 items-center justify-between border-b border-[#1e2633] bg-[#0e1218] px-3">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
             <div className="h-3.5 w-3.5 border border-slate-400 bg-slate-200/10" />
             <span className="font-mono text-xs font-bold tracking-[0.16em] text-slate-100">
-              GEOPULSE <span className="text-slate-500">//</span> ONTOLOGY
+              GEOPULSE <span className="text-slate-500">//</span> LOCAL WORKSTATION
             </span>
           </div>
 
           <div className="hidden h-4 w-px bg-[#1e2633] md:block" />
 
-          {/* Telemetry Counters */}
           <div className="hidden items-center gap-4 font-mono text-[10px] tabular-nums md:flex">
             <div className="flex items-center gap-1.5">
-              <span className="text-slate-500">GLOBAL RISK</span>
+              <span className="text-slate-500">RISK</span>
               <span className={`border px-1.5 py-0.5 font-bold ${severityBadgeClass(snapshot.globalRiskIndex)}`}>
                 {snapshot.globalRiskIndex} [{snapshot.riskLabel}]
               </span>
@@ -187,9 +274,11 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
               </span>
             </div>
             <div className="text-slate-400">
-              OBJECTS {snapshot.ontology.nodes.length} · LINKS {snapshot.ontology.edges.length}
+              ONTOLOGY {snapshot.ontology.nodes.length}N · {snapshot.ontology.edges.length}E
             </div>
-            <div className="text-slate-500">SCANNED {snapshot.totalArticlesScanned} · {formatUtcShort(snapshot.generatedAt)}</div>
+            <div className="text-slate-500">
+              SQLITE ARCHIVE {snapshot.archiveCount} · {formatUtcShort(snapshot.generatedAt)}
+            </div>
           </div>
         </div>
 
@@ -200,8 +289,8 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={lang === "de" ? "Objekt / Ticker / Akteur…" : "Filter object / ticker / actor…"}
-              className="w-48 border border-[#232d3d] bg-[#0a0c10] py-1 pl-6 pr-2 text-[11px] text-slate-200 placeholder-slate-600 focus:border-slate-500 focus:outline-none"
+              placeholder={lang === "de" ? "Suche Objekt / Ticker…" : "Filter object / ticker…"}
+              className="w-44 border border-[#232d3d] bg-[#0a0c10] py-1 pl-6 pr-2 text-[11px] text-slate-200 placeholder-slate-600 focus:border-slate-500 focus:outline-none"
             />
           </div>
 
@@ -230,27 +319,25 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
           </button>
 
           <button
-            onClick={() => setAlertsOpen(true)}
-            className="border border-[#2b374b] bg-[#151e2c] px-2.5 py-1 text-slate-200 transition hover:border-slate-400 hover:text-white"
+            onClick={() => setConfigOpen(true)}
+            className="inline-flex items-center gap-1.5 border border-[#2b374b] bg-[#151e2c] px-2.5 py-1 text-slate-200 transition hover:border-slate-400 hover:text-white"
           >
-            ALERTS / API
+            <Settings className="h-3 w-3" />
+            <span>CONFIG</span>
           </button>
         </div>
       </header>
 
-      {/* 2. Static High-Density Market Instruments Strip (Click any instrument to pivot Ontology!) */}
+      {/* 2. Live Market Watchlist Strip */}
       <div className="flex items-center gap-1 overflow-x-auto border-b border-[#1e2633] bg-[#0b0f15] px-3 py-1 font-mono text-[10px] tabular-nums">
-        <span className="mr-2 shrink-0 text-slate-500 uppercase">EXPOSED INSTRUMENTS //</span>
+        <span className="mr-2 shrink-0 text-slate-500 uppercase">WATCHLIST //</span>
         {snapshot.markets.map((m) => {
           const up = m.changePercent >= 0;
           const isSelected = inspector?.kind === "ASSET" && inspector.ticker === m.symbol;
           return (
             <button
               key={m.symbol}
-              onClick={() => {
-                setConsoleOutput(null);
-                setInspector({ kind: "ASSET", ticker: m.symbol, label: m.label });
-              }}
+              onClick={() => setInspector({ kind: "ASSET", ticker: m.symbol, label: m.label })}
               className={`flex shrink-0 items-center gap-1.5 border px-2 py-0.5 transition ${
                 isSelected
                   ? "border-slate-400 bg-[#1a2433] text-white"
@@ -271,9 +358,9 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
         })}
       </div>
 
-      {/* 3. Main 3-Pane Palantir Workstation */}
+      {/* 3. Docked 3-Pane Intelligence Workstation */}
       <div className="grid flex-1 grid-cols-1 lg:grid-cols-12">
-        {/* LEFT PANE (3 cols): ONTOLOGY OBJECT EXPLORER */}
+        {/* LEFT PANE: OBJECT EXPLORER */}
         <aside className="flex flex-col border-b border-[#1e2633] bg-[#0c1016] lg:col-span-3 lg:h-[calc(100vh-76px)] lg:border-b-0 lg:border-r">
           <div className="grid grid-cols-3 border-b border-[#1e2633] bg-[#0e1218] font-mono text-[10px]">
             <button
@@ -302,9 +389,8 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
             </button>
           </div>
 
-          {/* Region quick-filter bar */}
           {explorerTab === "events" && (
-            <div className="flex flex-wrap gap-1 border-b border-[#18202c] bg-[#0a0e14] p-2 font-mono text-[9.5px]">
+            <div className="flex flex-wrap items-center gap-1 border-b border-[#18202c] bg-[#0a0e14] p-2 font-mono text-[9.5px]">
               {(["ALL", "Middle East", "Europe", "Indo-Pacific", "Americas", "Africa"] as const).map((r) => (
                 <button
                   key={r}
@@ -318,32 +404,38 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                   {r.toUpperCase()}
                 </button>
               ))}
+              <button
+                onClick={() => setPinnedOnly((p) => !p)}
+                className={`ml-auto border px-1.5 py-0.5 transition ${
+                  pinnedOnly ? "border-amber-500/70 bg-amber-500/15 text-amber-300" : "border-[#1b2330] text-slate-500 hover:text-slate-300"
+                }`}
+              >
+                ★ PINNED
+              </button>
             </div>
           )}
 
-          {/* Explorer List */}
           <div className="max-h-[420px] flex-1 divide-y divide-[#161d28] overflow-y-auto lg:max-h-none">
             {explorerTab === "events" &&
               filteredEvents.map((ev) => {
                 const active = inspector?.kind === "EVENT" && inspector.event.id === ev.id;
+                const isPin = annotations[ev.code]?.pinned;
                 return (
                   <button
                     key={ev.id}
-                    onClick={() => {
-                      setConsoleOutput(null);
-                      setInspector({ kind: "EVENT", event: ev });
-                    }}
+                    onClick={() => setInspector({ kind: "EVENT", event: ev })}
                     className={`w-full px-3 py-2.5 text-left transition ${
-                      active ? "bg-[#151e2d] border-l-2 border-l-slate-200" : "hover:bg-[#111722]"
+                      active ? "border-l-2 border-l-slate-200 bg-[#151e2d]" : "hover:bg-[#111722]"
                     }`}
                   >
                     <div className="mb-1 flex items-center justify-between font-mono text-[10px]">
                       <div className="flex items-center gap-1.5">
+                        {isPin && <span className="text-amber-400">★</span>}
                         <span className="font-bold text-slate-300">{ev.code}</span>
                         <span className={`border px-1 py-0 text-[9px] font-bold ${severityBadgeClass(ev.severity)}`}>
                           {ev.severity}
                         </span>
-                        <span className="text-slate-500">{ev.countryOrZone}</span>
+                        <span className="truncate text-slate-500">{ev.countryOrZone}</span>
                       </div>
                       <span className="text-slate-600">{formatUtcShort(ev.publishedAt)}</span>
                     </div>
@@ -362,12 +454,9 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                 return (
                   <button
                     key={ent.id}
-                    onClick={() => {
-                      setConsoleOutput(null);
-                      setInspector({ kind: "ENTITY", entity: ent });
-                    }}
+                    onClick={() => setInspector({ kind: "ENTITY", entity: ent })}
                     className={`w-full px-3 py-2.5 text-left transition ${
-                      active ? "bg-[#151e2d] border-l-2 border-l-[#60a5fa]" : "hover:bg-[#111722]"
+                      active ? "border-l-2 border-l-[#60a5fa] bg-[#151e2d]" : "hover:bg-[#111722]"
                     }`}
                   >
                     <div className="flex items-center justify-between font-mono text-[10px]">
@@ -411,54 +500,50 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
           </div>
         </aside>
 
-        {/* CENTER PANE (6 cols): ANALYTICAL VIEWPORT (ONTOLOGY GRAPH / GEOSPATIAL / SIGNALS MATRIX) */}
+        {/* CENTER PANE: 4 ANALYTICAL VIEWS */}
         <section className="flex flex-col border-b border-[#1e2633] lg:col-span-6 lg:h-[calc(100vh-76px)] lg:border-b-0 lg:border-r">
-          {/* Center View Switcher */}
-          <div className="flex items-center justify-between border-b border-[#1e2633] bg-[#0e1218] px-3 py-1 font-mono text-[10px]">
-            <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1e2633] bg-[#0e1218] px-3 py-1 font-mono text-[10px]">
+            <div className="flex flex-wrap items-center gap-1">
               <button
                 onClick={() => setCenterView("graph")}
-                className={`inline-flex items-center gap-1.5 border px-2.5 py-1 transition ${
-                  centerView === "graph"
-                    ? "border-slate-500 bg-[#1a2433] font-semibold text-white"
-                    : "border-transparent text-slate-500 hover:text-slate-300"
+                className={`inline-flex items-center gap-1.5 border px-2 py-1 transition ${
+                  centerView === "graph" ? "border-slate-500 bg-[#1a2433] font-semibold text-white" : "border-transparent text-slate-500 hover:text-slate-300"
                 }`}
               >
-                <Network className="h-3 w-3" /> [01] ONTOLOGY GRAPH
+                <Network className="h-3 w-3" /> [01] ONTOLOGY
               </button>
               <button
                 onClick={() => setCenterView("geo")}
-                className={`inline-flex items-center gap-1.5 border px-2.5 py-1 transition ${
-                  centerView === "geo"
-                    ? "border-slate-500 bg-[#1a2433] font-semibold text-white"
-                    : "border-transparent text-slate-500 hover:text-slate-300"
+                className={`inline-flex items-center gap-1.5 border px-2 py-1 transition ${
+                  centerView === "geo" ? "border-slate-500 bg-[#1a2433] font-semibold text-white" : "border-transparent text-slate-500 hover:text-slate-300"
                 }`}
               >
                 <Globe2 className="h-3 w-3" /> [02] GEOSPATIAL
               </button>
               <button
                 onClick={() => setCenterView("matrix")}
-                className={`inline-flex items-center gap-1.5 border px-2.5 py-1 transition ${
-                  centerView === "matrix"
-                    ? "border-slate-500 bg-[#1a2433] font-semibold text-white"
-                    : "border-transparent text-slate-500 hover:text-slate-300"
+                className={`inline-flex items-center gap-1.5 border px-2 py-1 transition ${
+                  centerView === "matrix" ? "border-slate-500 bg-[#1a2433] font-semibold text-white" : "border-transparent text-slate-500 hover:text-slate-300"
                 }`}
               >
-                <Table2 className="h-3 w-3" /> [03] SIGNALS MATRIX
+                <Table2 className="h-3 w-3" /> [03] MATRIX
+              </button>
+              <button
+                onClick={() => setCenterView("archive")}
+                className={`inline-flex items-center gap-1.5 border px-2 py-1 transition ${
+                  centerView === "archive" ? "border-slate-500 bg-[#1a2433] font-semibold text-white" : "border-transparent text-slate-500 hover:text-slate-300"
+                }`}
+              >
+                <History className="h-3 w-3" /> [04] SQLITE ARCHIVE ({snapshot.archiveCount})
               </button>
             </div>
-
-            <span className="hidden text-slate-500 sm:inline">
-              {snapshot.briefing.mode === "llm-enhanced" ? "SYNTHESIS: LLM" : "SYNTHESIS: ONTOLOGY ENGINE"}
-            </span>
           </div>
 
-          {/* Active Center View */}
           <div className="flex-1 overflow-hidden">
             {centerView === "graph" && (
               <OntologyGraphView
                 graph={snapshot.ontology}
-                selectedNodeId={selectedGraphNodeId}
+                selectedNodeId={currentObjectId}
                 onSelectNode={handleSelectGraphNode}
                 lang={lang}
               />
@@ -468,10 +553,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
               <WorldMap
                 events={filteredEvents}
                 selectedEventId={inspector?.kind === "EVENT" ? inspector.event.id : null}
-                onSelectEvent={(ev) => {
-                  setConsoleOutput(null);
-                  setInspector({ kind: "EVENT", event: ev });
-                }}
+                onSelectEvent={(ev) => setInspector({ kind: "EVENT", event: ev })}
                 lang={lang}
               />
             )}
@@ -493,14 +575,9 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                     {filteredEvents.map((ev) => (
                       <tr
                         key={ev.id}
-                        onClick={() => {
-                          setConsoleOutput(null);
-                          setInspector({ kind: "EVENT", event: ev });
-                        }}
+                        onClick={() => setInspector({ kind: "EVENT", event: ev })}
                         className={`cursor-pointer transition ${
-                          inspector?.kind === "EVENT" && inspector.event.id === ev.id
-                            ? "bg-[#162030]"
-                            : "hover:bg-[#101620]"
+                          inspector?.kind === "EVENT" && inspector.event.id === ev.id ? "bg-[#162030]" : "hover:bg-[#101620]"
                         }`}
                       >
                         <td className="px-3 py-2 font-bold text-slate-400">{ev.code}</td>
@@ -521,11 +598,82 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                 </table>
               </div>
             )}
+
+            {centerView === "archive" && (
+              <div className="flex h-full flex-col bg-[#0a0c10] p-3">
+                {/* Real Historical Global Risk Index Chart from Local SQLite */}
+                <div className="mb-3 border border-[#1e2633] bg-[#0e1218] p-3">
+                  <div className="mb-2 flex items-center justify-between font-mono text-[10px] text-slate-400">
+                    <span>LOCAL SQLITE RISK INDEX TIMELINE ({snapshot.riskHistory.length} SNAPSHOTS)</span>
+                    <span>LATEST: {snapshot.globalRiskIndex}/100</span>
+                  </div>
+                  <svg viewBox="0 0 600 84" className="h-20 w-full bg-[#0a0c10]">
+                    <line x1="0" y1="21" x2="600" y2="21" stroke="#18202c" strokeDasharray="2 3" />
+                    <line x1="0" y1="42" x2="600" y2="42" stroke="#18202c" strokeDasharray="2 3" />
+                    <line x1="0" y1="63" x2="600" y2="63" stroke="#18202c" strokeDasharray="2 3" />
+                    {snapshot.riskHistory.length > 0 && (
+                      <polyline
+                        fill="none"
+                        stroke="#60a5fa"
+                        strokeWidth="1.8"
+                        points={snapshot.riskHistory
+                          .map((pt, idx) => {
+                            const x =
+                              snapshot.riskHistory.length === 1
+                                ? 300
+                                : (idx / (snapshot.riskHistory.length - 1)) * 580 + 10;
+                            const y = 78 - (pt.globalRiskIndex / 100) * 70;
+                            return `${x.toFixed(1)},${y.toFixed(1)}`;
+                          })
+                          .join(" ")}
+                      />
+                    )}
+                    {snapshot.riskHistory.map((pt, idx) => {
+                      const x =
+                        snapshot.riskHistory.length === 1
+                          ? 300
+                          : (idx / (snapshot.riskHistory.length - 1)) * 580 + 10;
+                      const y = 78 - (pt.globalRiskIndex / 100) * 70;
+                      return <circle key={pt.id} cx={x} cy={y} r="2.8" fill={pt.globalRiskIndex >= 75 ? "#dc2626" : "#60a5fa"} />;
+                    })}
+                  </svg>
+                </div>
+
+                {/* Searchable Local SQLite Event Archive */}
+                <div className="mb-2 flex items-center gap-2">
+                  <input
+                    value={archiveQuery}
+                    onChange={(e) => setArchiveQuery(e.target.value)}
+                    placeholder="SQLite Archiv durchsuchen (Headline, Land, EVT-Code)…"
+                    className="flex-1 border border-[#232d3d] bg-[#0e1218] px-3 py-1.5 font-mono text-[11px] text-white placeholder-slate-600 focus:border-slate-400 focus:outline-none"
+                  />
+                  <span className="font-mono text-[10px] text-slate-500">{archiveEvents.length} Treffer</span>
+                </div>
+
+                <div className="flex-1 divide-y divide-[#151c27] overflow-y-auto border border-[#1e2633]">
+                  {archiveEvents.map((ev) => (
+                    <button
+                      key={ev.id}
+                      onClick={() => setInspector({ kind: "EVENT", event: ev })}
+                      className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition hover:bg-[#111722]"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-mono text-[10px] text-slate-400">
+                          <span className="font-bold text-slate-200">{ev.code}</span> · SEV {ev.severity} · {ev.countryOrZone} ·{" "}
+                          {new Date(ev.publishedAt).toLocaleString("de-DE")}
+                        </div>
+                        <div className="truncate text-xs text-slate-200">{ev.headline}</div>
+                      </div>
+                      <span className="shrink-0 font-mono text-[10px] text-slate-500">{ev.sources.length} SRC</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Bottom Docked Regional Risk & Executive Synthesis Strip */}
-          <div className="border-t border-[#1e2633] bg-[#0e1218] px-3 py-2">
-            <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[10px]">
+          <div className="border-t border-[#1e2633] bg-[#0e1218] px-3 py-2 font-mono text-[10px]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-3">
                 <span className="text-slate-500">THEATER INDICES //</span>
                 {snapshot.regionalRisks.slice(0, 5).map((rr) => (
@@ -535,11 +683,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                     className="flex items-center gap-1.5 hover:text-white"
                   >
                     <span className="text-slate-400">{rr.region.toUpperCase()}</span>
-                    <span
-                      className={`font-bold tabular-nums ${
-                        rr.score >= 72 ? "text-rose-400" : rr.score >= 55 ? "text-amber-400" : "text-slate-300"
-                      }`}
-                    >
+                    <span className={`font-bold tabular-nums ${rr.score >= 72 ? "text-rose-400" : rr.score >= 55 ? "text-amber-400" : "text-slate-300"}`}>
                       {rr.score}
                     </span>
                   </button>
@@ -552,20 +696,40 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
           </div>
         </section>
 
-        {/* RIGHT PANE (3 cols): DOCKED PALANTIR OBJECT INSPECTOR */}
+        {/* RIGHT PANE: DOCKED OBJECT INSPECTOR + ANALYST WORKBENCH */}
         <aside className="flex flex-col bg-[#0c1016] lg:col-span-3 lg:h-[calc(100vh-76px)]">
-          <div className="flex items-center justify-between border-b border-[#1e2633] bg-[#0e1218] px-3 py-2 font-mono text-[10px]">
+          <div className="flex items-center justify-between border-b border-[#1e2633] bg-[#0e1218] px-3 py-1.5 font-mono text-[10px]">
             <span className="flex items-center gap-1.5 font-semibold tracking-wider text-slate-200 uppercase">
               <Database className="h-3 w-3 text-slate-400" />
-              OBJECT INSPECTOR
+              INSPECTOR {currentObjectId ? `// ${currentObjectId}` : ""}
             </span>
-            {inspector && (
-              <span className="text-slate-500">{inspector.kind}</span>
+
+            {currentObjectId && (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => persistAnnotation(currentObjectId, noteDraft, !isCurrentPinned)}
+                  className={`inline-flex items-center gap-1 border px-1.5 py-0.5 transition ${
+                    isCurrentPinned
+                      ? "border-amber-500/70 bg-amber-500/15 text-amber-300"
+                      : "border-[#232d3d] text-slate-400 hover:text-white"
+                  }`}
+                  title="Pin to Personal Watchlist"
+                >
+                  <Bookmark className="h-3 w-3" /> {isCurrentPinned ? "PINNED" : "PIN"}
+                </button>
+                <button
+                  onClick={exportDossierMarkdown}
+                  className="inline-flex items-center gap-1 border border-[#232d3d] px-1.5 py-0.5 text-slate-400 hover:text-white"
+                  title="Export Case Dossier (.md)"
+                >
+                  <Download className="h-3 w-3" /> .MD
+                </button>
+              </div>
             )}
           </div>
 
           <div className="flex-1 space-y-4 overflow-y-auto p-3.5 text-xs">
-            {/* EVENT INSPECTOR */}
+            {/* EVENT VIEW */}
             {inspector?.kind === "EVENT" && (
               <>
                 <div>
@@ -581,7 +745,6 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                   </p>
                 </div>
 
-                {/* Metadata Grid */}
                 <div className="grid grid-cols-2 gap-px border border-[#1e2633] bg-[#1e2633] font-mono text-[10px]">
                   <div className="bg-[#0a0e14] p-2">
                     <div className="text-slate-500">THEATER</div>
@@ -603,7 +766,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                   </div>
                 </div>
 
-                {/* Linked Ontology Entities (1-click pivot!) */}
+                {/* Linked Entities */}
                 <div>
                   <div className="mb-1.5 font-mono text-[10px] font-semibold tracking-wider text-slate-500 uppercase">
                     LINKED ENTITIES ({inspector.event.entityIds.length})
@@ -622,13 +785,10 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                         </button>
                       );
                     })}
-                    {inspector.event.entityIds.length === 0 && (
-                      <span className="font-mono text-[10px] text-slate-600">No explicit state/actor extracted</span>
-                    )}
                   </div>
                 </div>
 
-                {/* Market Impact Vectors */}
+                {/* Market Vectors */}
                 <div>
                   <div className="mb-1.5 font-mono text-[10px] font-semibold tracking-wider text-slate-500 uppercase">
                     MARKET TRANSMISSION VECTORS
@@ -656,23 +816,13 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                             {m.direction.toUpperCase()} ({m.confidence}%)
                           </span>
                         </div>
-                        <p className="mt-1 text-[11px] text-slate-400">
-                          {lang === "de" ? m.rationaleDe : m.rationaleEn}
-                        </p>
+                        <p className="mt-1 text-[11px] text-slate-400">{lang === "de" ? m.rationaleDe : m.rationaleEn}</p>
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* 72h Watchpoint */}
-                <div className="border-l-2 border-[#d97706] bg-[#14120e] p-2.5">
-                  <div className="font-mono text-[10px] font-bold text-[#fbbf24]">72H WATCHPOINT</div>
-                  <p className="mt-1 text-[11px] leading-relaxed text-slate-300">
-                    {lang === "de" ? inspector.event.watchpoint72hDe : inspector.event.watchpoint72hEn}
-                  </p>
-                </div>
-
-                {/* Source Corroboration Matrix */}
+                {/* Dispatches + Live Full-Text Extractor */}
                 <div>
                   <div className="mb-1.5 flex items-center justify-between font-mono text-[10px] font-semibold tracking-wider text-slate-500 uppercase">
                     <span>CORROBORATING DISPATCHES ({inspector.event.sources.length})</span>
@@ -680,31 +830,52 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                   </div>
                   <div className="divide-y divide-[#18202c] border border-[#1e2633] bg-[#0a0e14]">
                     {inspector.event.sources.map((src, i) => (
-                      <a
-                        key={i}
-                        href={src.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="group flex items-start justify-between gap-2 p-2 transition hover:bg-[#111824]"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5 font-mono text-[10px]">
-                            <span className="font-semibold text-slate-200">{src.sourceName}</span>
-                            <span className="text-slate-500">[{src.perspective}]</span>
+                      <div key={i} className="p-2">
+                        <div className="flex items-center justify-between gap-2 font-mono text-[10px]">
+                          <span className="font-semibold text-slate-200">
+                            {src.sourceName} <span className="font-normal text-slate-500">[{src.perspective}]</span>
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => fetchFullArticle(src.title, src.url)}
+                              className="inline-flex items-center gap-1 border border-[#253143] px-1.5 py-0.5 text-[9.5px] text-slate-300 hover:border-slate-400 hover:text-white"
+                            >
+                              <FileText className="h-2.5 w-2.5" /> READ
+                            </button>
+                            <a
+                              href={src.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-slate-500 hover:text-slate-200"
+                            >
+                              <ArrowUpRight className="h-3.5 w-3.5" />
+                            </a>
                           </div>
-                          <p className="mt-0.5 truncate text-[11px] text-slate-400 group-hover:text-slate-200">
-                            {src.title}
-                          </p>
                         </div>
-                        <ArrowUpRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-600 group-hover:text-slate-200" />
-                      </a>
+                        <p className="mt-1 text-[11px] text-slate-400">{src.title}</p>
+                      </div>
                     ))}
                   </div>
                 </div>
+
+                {/* Inline Extracted Full Dispatch Reader */}
+                {articleReader && (
+                  <div className="border border-[#2a374b] bg-[#0a0f18] p-2.5">
+                    <div className="mb-1.5 flex items-center justify-between font-mono text-[10px] text-slate-300">
+                      <span>FULL DISPATCH EXTRACT</span>
+                      <button onClick={() => setArticleReader(null)} className="text-slate-500 hover:text-white">
+                        CLOSE
+                      </button>
+                    </div>
+                    <div className="max-h-56 overflow-y-auto whitespace-pre-line text-[11.5px] leading-relaxed text-slate-300">
+                      {articleReader.loading ? "Extrahiere Volltext direkt von der Quelle…" : articleReader.text}
+                    </div>
+                  </div>
+                )}
               </>
             )}
 
-            {/* ENTITY INSPECTOR (Palantir Pivot!) */}
+            {/* ENTITY / ASSET / CHOKEPOINT PIVOT VIEWS */}
             {inspector?.kind === "ENTITY" && (
               <>
                 <div className="border-b border-[#1e2633] pb-3">
@@ -719,51 +890,26 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                   </div>
                 </div>
 
-                <div>
-                  <div className="mb-1.5 font-mono text-[10px] font-semibold text-slate-500 uppercase">
-                    EXPOSED INSTRUMENTS
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {inspector.entity.linkedAssetTickers.map((t) => (
+                <div className="divide-y divide-[#18202c] border border-[#1e2633] bg-[#0a0e14]">
+                  {snapshot.events
+                    .filter((ev) => inspector.entity.eventIds.includes(ev.id))
+                    .map((ev) => (
                       <button
-                        key={t}
-                        onClick={() => setInspector({ kind: "ASSET", ticker: t, label: "Linked Instrument" })}
-                        className="border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] text-emerald-300"
+                        key={ev.id}
+                        onClick={() => setInspector({ kind: "EVENT", event: ev })}
+                        className="w-full p-2.5 text-left transition hover:bg-[#121a27]"
                       >
-                        {t}
+                        <div className="flex items-center justify-between font-mono text-[10px]">
+                          <span className="font-bold text-slate-300">{ev.code}</span>
+                          <span className={`border px-1 text-[9px] ${severityBadgeClass(ev.severity)}`}>SEV {ev.severity}</span>
+                        </div>
+                        <p className="mt-1 text-xs text-slate-200">{ev.headline}</p>
                       </button>
                     ))}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-1.5 font-mono text-[10px] font-semibold text-slate-500 uppercase">
-                    INVOLVED EVENTS ({inspector.entity.eventIds.length})
-                  </div>
-                  <div className="divide-y divide-[#18202c] border border-[#1e2633] bg-[#0a0e14]">
-                    {snapshot.events
-                      .filter((ev) => inspector.entity.eventIds.includes(ev.id))
-                      .map((ev) => (
-                        <button
-                          key={ev.id}
-                          onClick={() => setInspector({ kind: "EVENT", event: ev })}
-                          className="w-full p-2.5 text-left transition hover:bg-[#121a27]"
-                        >
-                          <div className="flex items-center justify-between font-mono text-[10px]">
-                            <span className="font-bold text-slate-300">{ev.code}</span>
-                            <span className={`border px-1 text-[9px] ${severityBadgeClass(ev.severity)}`}>
-                              SEV {ev.severity}
-                            </span>
-                          </div>
-                          <p className="mt-1 text-xs text-slate-200">{ev.headline}</p>
-                        </button>
-                      ))}
-                  </div>
                 </div>
               </>
             )}
 
-            {/* ASSET INSPECTOR */}
             {inspector?.kind === "ASSET" && (
               <>
                 <div className="border-b border-[#1e2633] pb-3">
@@ -772,32 +918,25 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                     {inspector.ticker} — {inspector.label}
                   </h2>
                 </div>
-                <div>
-                  <div className="mb-1.5 font-mono text-[10px] font-semibold text-slate-500 uppercase">
-                    GEOPOLITICAL DRIVERS LINKED TO {inspector.ticker}
-                  </div>
-                  <div className="divide-y divide-[#18202c] border border-[#1e2633] bg-[#0a0e14]">
-                    {snapshot.events
-                      .filter((ev) => ev.marketImpacts.some((m) => m.ticker.includes(inspector.ticker)))
-                      .map((ev) => (
-                        <button
-                          key={ev.id}
-                          onClick={() => setInspector({ kind: "EVENT", event: ev })}
-                          className="w-full p-2.5 text-left transition hover:bg-[#121a27]"
-                        >
-                          <div className="flex items-center justify-between font-mono text-[10px]">
-                            <span className="font-bold text-slate-300">{ev.code} · {ev.countryOrZone}</span>
-                            <span className={`border px-1 text-[9px] ${severityBadgeClass(ev.severity)}`}>SEV {ev.severity}</span>
-                          </div>
-                          <p className="mt-1 text-xs text-slate-200">{ev.headline}</p>
-                        </button>
-                      ))}
-                  </div>
+                <div className="divide-y divide-[#18202c] border border-[#1e2633] bg-[#0a0e14]">
+                  {snapshot.events
+                    .filter((ev) => ev.marketImpacts.some((m) => m.ticker.includes(inspector.ticker)))
+                    .map((ev) => (
+                      <button
+                        key={ev.id}
+                        onClick={() => setInspector({ kind: "EVENT", event: ev })}
+                        className="w-full p-2.5 text-left transition hover:bg-[#121a27]"
+                      >
+                        <div className="font-mono text-[10px] text-slate-400">
+                          {ev.code} · SEV {ev.severity} · {ev.countryOrZone}
+                        </div>
+                        <p className="mt-1 text-xs text-slate-200">{ev.headline}</p>
+                      </button>
+                    ))}
                 </div>
               </>
             )}
 
-            {/* CHOKEPOINT INSPECTOR */}
             {inspector?.kind === "CHOKEPOINT" && (
               <>
                 <div className="border-b border-[#1e2633] pb-3">
@@ -822,9 +961,31 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                 </div>
               </>
             )}
+
+            {/* Personal Analyst Notes (Persisted to Local SQLite) */}
+            {currentObjectId && (
+              <div className="border-t border-[#1e2633] pt-3">
+                <div className="mb-1.5 flex items-center justify-between font-mono text-[10px] text-slate-500">
+                  <span>ANALYST NOTES (SQLITE LOCAL)</span>
+                  <button
+                    onClick={() => persistAnnotation(currentObjectId, noteDraft, isCurrentPinned)}
+                    className="inline-flex items-center gap-1 border border-[#273449] bg-[#111926] px-2 py-0.5 text-slate-200 hover:border-slate-400"
+                  >
+                    <Save className="h-3 w-3" /> {noteSavedFlash ? "SAVED" : "SAVE"}
+                  </button>
+                </div>
+                <textarea
+                  rows={3}
+                  value={noteDraft}
+                  onChange={(e) => setNoteDraft(e.target.value)}
+                  placeholder="Eigene Einschätzung, Trade-Idee oder Beobachtung zu diesem Objekt…"
+                  className="w-full border border-[#232d3d] bg-[#0a0c10] p-2 font-mono text-[11px] text-slate-200 placeholder-slate-600 focus:border-slate-500 focus:outline-none"
+                />
+              </div>
+            )}
           </div>
 
-          {/* Docked Monospace Analyst Query Console */}
+          {/* Local Ontology Query Console (Ollama / Local Engine / Optional Key) */}
           <div className="border-t border-[#1e2633] bg-[#0a0d12] p-3">
             <div className="mb-1.5 flex items-center gap-1.5 font-mono text-[10px] text-slate-500">
               <Terminal className="h-3 w-3 text-slate-400" />
@@ -842,7 +1003,7 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
                 type="text"
                 value={consoleInput}
                 onChange={(e) => setConsoleInput(e.target.value)}
-                placeholder={lang === "de" ? "> Risiko, Markt-Impact oder Szenario abfragen…" : "> query escalation, exposure, or scenario…"}
+                placeholder={lang === "de" ? "> Risiko, Sektor oder Szenario abfragen…" : "> query risk, exposure, or scenario…"}
                 className="flex-1 border border-[#232d3d] bg-[#0e1218] px-2.5 py-1.5 font-mono text-[11px] text-slate-100 placeholder-slate-600 focus:border-slate-500 focus:outline-none"
               />
               <button
@@ -857,8 +1018,13 @@ export function GeoPulseTerminal({ initialSnapshot }: GeoPulseTerminalProps) {
         </aside>
       </div>
 
-      {/* Institutional Alert / API Subscription Modal (only opened on explicit button click) */}
-      <ProAlertsModal open={alertsOpen} onClose={() => setAlertsOpen(false)} lang={lang} />
+      {/* Local Software Config Modal (Custom Feeds, Custom Tickers, Local Ollama) */}
+      <LocalConfigModal
+        open={configOpen}
+        onClose={() => setConfigOpen(false)}
+        onConfigChanged={() => syncNow(true)}
+        lang={lang}
+      />
     </div>
   );
 }

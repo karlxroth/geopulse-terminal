@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getLocalSettings } from "@/lib/db";
 import { getIntelligenceSnapshot } from "@/lib/store";
 import type { GeoEvent } from "@/lib/types";
 
@@ -41,15 +42,41 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "No intelligence events available" }, { status: 404 });
     }
 
-    const geminiKey = process.env.GEMINI_API_KEY?.trim();
-    const openaiKey = process.env.OPENAI_API_KEY?.trim();
+    const localSettings = getLocalSettings();
+    const ollamaUrl = (localSettings.ollamaUrl || process.env.OLLAMA_URL || "").trim();
+    const ollamaModel = (localSettings.ollamaModel || process.env.OLLAMA_MODEL || "llama3.2").trim();
+    const geminiKey = (localSettings.geminiApiKey || process.env.GEMINI_API_KEY || "").trim();
+    const openaiKey = (localSettings.openaiApiKey || process.env.OPENAI_API_KEY || "").trim();
 
-    const sysPrompt = `You are GeoPulse AI, a concise institutional geopolitical & financial intelligence analyst.
-Respond in ${lang === "de" ? "German" : "English"} in max 4 crisp bullet points. Never give personalized financial advice, frame as macro/sector impact analysis.
-Event: ${event.headline}
+    const sysPrompt = `You are GeoPulse Ontology Analyst, a crisp institutional geopolitical & financial intelligence engine.
+Respond in ${lang === "de" ? "German" : "English"} in max 4 dense bullet points. No fluff.
+Event: [${event.code}] ${event.headline}
 Region: ${event.region} (${event.countryOrZone}), Severity: ${event.severity}/100, Category: ${event.category}
+Entities: ${event.entityNames.join(", ") || "N/A"}
 Sources (${event.sources.length}): ${event.sources.map((s) => `${s.sourceName} (${s.perspective})`).join(", ")}
 Market Impacts: ${event.marketImpacts.map((m) => `${m.sector} [${m.ticker}] ${m.direction}`).join("; ")}`;
+
+    // 1. Local Ollama (100% private on Mac!)
+    if (ollamaUrl) {
+      try {
+        const res = await fetch(`${ollamaUrl.replace(/\/$/, "")}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: ollamaModel,
+            prompt: `${sysPrompt}\n\nQuery: ${question}`,
+            stream: false,
+          }),
+          signal: AbortSignal.timeout(12000),
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json?.response) return NextResponse.json({ answer: json.response, mode: `ollama:${ollamaModel}` });
+        }
+      } catch {
+        // Fall through
+      }
+    }
 
     if (geminiKey) {
       try {

@@ -150,6 +150,37 @@ export interface ExecutiveBriefing {
   topMarketCallEn: string;
 }
 
+export interface RiskHistoryPoint {
+  id: number;
+  recordedAt: string;
+  globalRiskIndex: number;
+  sourcesOnline: number;
+  articlesScanned: number;
+  eventsCount: number;
+}
+
+export interface AnalystAnnotation {
+  objectId: string;
+  note: string;
+  pinned: boolean;
+  updatedAt: string;
+}
+
+export interface CustomFeedRecord {
+  id: number;
+  sourceName: string;
+  perspective: SourcePerspective;
+  url: string;
+}
+
+export interface CustomTickerRecord {
+  symbol: string;
+  label: string;
+  category: MarketQuote["category"];
+  currency: string;
+  geoDriver: string;
+}
+
 export interface IntelligenceSnapshot {
   generatedAt: string;
   nextAutoSyncAt: string;
@@ -164,4 +195,9 @@ export interface IntelligenceSnapshot {
   markets: MarketQuote[];
   regionalRisks: RegionalRisk[];
   briefing: ExecutiveBriefing;
+  riskHistory: RiskHistoryPoint[];
+  archiveCount: number;
+  annotations: Record<string, AnalystAnnotation>;
+  customFeeds: CustomFeedRecord[];
+  customTickers: CustomTickerRecord[];
 }
